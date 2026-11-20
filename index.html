@@ -96,16 +96,26 @@
           </div>
 
           <div>
-            <label for="modelSelect" class="block text-sm font-medium text-slate-200 mb-1.5">
-              Model Gemini
-            </label>
+            <div class="flex items-center justify-between gap-2 mb-1.5">
+              <label for="modelSelect" class="block text-sm font-medium text-slate-200">
+                Model Gemini
+              </label>
+              <button
+                type="button"
+                id="loadModelsBtn"
+                class="text-xs font-medium text-indigo-400 hover:text-indigo-300 transition"
+              >
+                Muat model aktif
+              </button>
+            </div>
             <select
               id="modelSelect"
               class="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 transition"
             >
-              <option value="gemini-2.5-flash" selected>gemini-2.5-flash (Cepat &amp; Akurat)</option>
-              <option value="gemini-2.5-pro">gemini-2.5-pro (Analisis Detail Maksimal)</option>
-              <option value="gemini-2.0-flash">gemini-2.0-flash (Alternatif)</option>
+              <option value="gemini-3-flash-preview" selected>gemini-3-flash-preview (Cepat &amp; Akurat)</option>
+              <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview (Analisis Detail Maksimal)</option>
+              <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview (Ringan &amp; Cepat)</option>
+              <option value="gemini-2.5-flash">gemini-2.5-flash (Alternatif)</option>
             </select>
           </div>
         </div>
@@ -343,7 +353,7 @@
     const clearKeyBtn = document.getElementById("clearKeyBtn");
     const keyStatus = document.getElementById("keyStatus");
     const modelSelect = document.getElementById("modelSelect");
-
+    const loadModelsBtn = document.getElementById("loadModelsBtn");
     const dropZone = document.getElementById("dropZone");
     const fileInput = document.getElementById("fileInput");
     const previewWrap = document.getElementById("previewWrap");
@@ -434,6 +444,63 @@
       apiKeyInput.value = "";
       setKeyStatus("API key dihapus dari browser lokal.", false);
       showToast("API key dihapus.");
+    });
+
+    loadModelsBtn.addEventListener("click", async () => {
+      clearError();
+      const apiKey = apiKeyInput.value.trim();
+      if (!apiKey) {
+        showError("Masukkan API key Gemini terlebih dahulu untuk memuat daftar model aktif.");
+        apiKeyInput.focus();
+        return;
+      }
+
+      loadModelsBtn.disabled = true;
+      loadModelsBtn.textContent = "Memuat...";
+      try {
+        const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models", {
+          headers: { "x-goog-api-key": apiKey }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data?.error?.message || `HTTP ${res.status}`);
+        }
+
+        const available = (data.models || [])
+          .filter((m) =>
+            m.supportedGenerationMethods?.includes("generateContent") &&
+            /^models\/gemini-/i.test(m.name) &&
+            !/(embedding|tts|live|image)/i.test(m.name)
+          )
+          .map((m) => ({
+            id: m.name.replace(/^models\//, ""),
+            label: m.displayName || m.name.replace(/^models\//, "")
+          }))
+          .sort((a, b) => b.id.localeCompare(a.id));
+
+        if (!available.length) {
+          throw new Error("Tidak ada model generateContent yang ditemukan untuk API key ini.");
+        }
+
+        const currentValue = modelSelect.value;
+        modelSelect.innerHTML = "";
+        for (const item of available) {
+          const opt = document.createElement("option");
+          opt.value = item.id;
+          opt.textContent = `${item.id} (${item.label})`;
+          modelSelect.appendChild(opt);
+        }
+
+        if (available.some((item) => item.id === currentValue)) {
+          modelSelect.value = currentValue;
+        }
+        showToast(`${available.length} model aktif dimuat.`);
+      } catch (err) {
+        showError(`Gagal memuat daftar model: ${err.message}`);
+      } finally {
+        loadModelsBtn.disabled = false;
+        loadModelsBtn.textContent = "Muat model aktif";
+      }
     });
 
     function showError(message) {
@@ -685,24 +752,41 @@
 
       setLoading(true);
       try {
-        // Pass API key via header so it does not leak into URL history or logs.
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": apiKey
-          },
-          body: JSON.stringify(payload)
-        });
+        let response;
+        let data = {};
+        const maxAttempts = 3;
 
-        const data = await response.json().catch(() => ({}));
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          // Pass API key via header so it does not leak into URL history or logs.
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": apiKey
+            },
+            body: JSON.stringify(payload)
+          });
+
+          data = await response.json().catch(() => ({}));
+
+          if ((response.status === 429 || response.status === 503) && attempt < maxAttempts - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 1000 * Math.pow(2, attempt)));
+            continue;
+          }
+          break;
+        }
 
         if (!response.ok) {
           const apiMsg = data?.error?.message || `HTTP ${response.status}`;
           throw new Error(`Permintaan ke Gemini gagal: ${apiMsg}`);
         }
 
-        const textPart = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        // Skip internal reasoning parts on thinking-enabled models.
+        const parts = data?.candidates?.[0]?.content?.parts || [];
+        const textPart =
+          parts.find((part) => !part.thought && typeof part.text === "string")?.text ||
+          parts.map((part) => part.text).filter(Boolean).join("");
+
         if (!textPart) {
           const reason = data?.candidates?.[0]?.finishReason || "Respons kosong";
           throw new Error(`AI tidak mengembalikan hasil (${reason}). Coba foto atau model lain.`);
